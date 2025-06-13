@@ -1,68 +1,56 @@
-from flask import Flask, request, send_file, jsonify
-from pptx import Presentation
-from pptx.util import Inches
+import io
 import requests
-import tempfile
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from pptx import Presentation
+from PIL import Image
+import fitz  # PyMuPDF
 import os
-import shutil
-import zipfile
-import subprocess
 
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route("/generate", methods=["POST"])
-def generate_ppt():
-    try:
-        data = request.get_json()
-        pptx_url = data.get("pptx_url")
-        qr_url = data.get("qr_url")
+@app.post("/pptx-api-crediviva")
+async def insert_qr(request: Request):
+    data = await request.json()
+    pptx_url = data["pptx_url"]
+    qr_url = data["qr_url"]
 
-        if not pptx_url or not qr_url:
-            return jsonify({"error": "Missing pptx_url or qr_url"}), 400
+    # Download files
+    pptx_response = requests.get(pptx_url)
+    qr_response = requests.get(qr_url)
+    pptx_bytes = io.BytesIO(pptx_response.content)
+    qr_img = Image.open(io.BytesIO(qr_response.content))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Download the pptx and QR
-            pptx_path = os.path.join(tmpdir, "template.pptx")
-            qr_path = os.path.join(tmpdir, "qr.png")
+    # Save QR image to disk
+    qr_path = "qr.png"
+    qr_img.save(qr_path)
 
-            with open(pptx_path, "wb") as f:
-                f.write(requests.get(pptx_url).content)
+    # Open PowerPoint
+    prs = Presentation(pptx_bytes)
+    slide = prs.slides[0]
+    slide.shapes.add_picture(qr_path, left=0, top=0, width=prs.slide_width // 4, height=prs.slide_height // 4)
 
-            with open(qr_path, "wb") as f:
-                f.write(requests.get(qr_url).content)
+    # Save PowerPoint
+    output_pptx_path = "output.pptx"
+    prs.save(output_pptx_path)
 
-            # Open presentation and insert QR
-            prs = Presentation(pptx_path)
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if shape.has_text_frame and "{{QR}}" in shape.text:
-                        left = shape.left
-                        top = shape.top
-                        height = shape.height
-                        width = shape.width
-                        slide.shapes._spTree.remove(shape._element)
-                        slide.shapes.add_picture(qr_path, left, top, width, height)
-            pptx_output_path = os.path.join(tmpdir, "Kit de Bienvenida - output.pptx")
-            prs.save(pptx_output_path)
+    # Convert to PDF using LibreOffice
+    os.system(f'libreoffice --headless --convert-to pdf "{output_pptx_path}" --outdir .')
+    output_pdf_path = "output.pdf"
 
-            # Convert to PDF using LibreOffice
-            pdf_output_path = pptx_output_path.replace(".pptx", ".pdf")
-            subprocess.run([
-                "libreoffice",
-                "--headless",
-                "--convert-to", "pdf",
-                "--outdir", tmpdir,
-                pptx_output_path
-            ], check=True)
+    # Prepare multipart response
+    def file_iter():
+        yield b"--boundary\n"
+        yield b'Content-Disposition: form-data; name="pptx"; filename="output.pptx"\n'
+        yield b"Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation\n\n"
+        yield open(output_pptx_path, "rb").read()
+        yield b"\n--boundary\n"
+        yield b'Content-Disposition: form-data; name="pdf"; filename="output.pdf"\n'
+        yield b"Content-Type: application/pdf\n\n"
+        yield open(output_pdf_path, "rb").read()
+        yield b"\n--boundary--"
 
-            # Create zip with both files
-            zip_path = os.path.join(tmpdir, "output_files.zip")
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                zipf.write(pptx_output_path, arcname="Kit de Bienvenida - output.pptx")
-                zipf.write(pdf_output_path, arcname="Kit de Bienvenida - output.pdf")
-
-            return send_file(zip_path, as_attachment=True, download_name="output_files.zip")
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+    return StreamingResponse(
+        content=file_iter(),
+        media_type="multipart/form-data; boundary=boundary"
+    )
